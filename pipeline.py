@@ -23,24 +23,47 @@ def probe_duration(path):
 
 def download_video(url, folder):
     # yt-dlp is used only when the user has rights/permission to download the source.
-    Path(folder).mkdir(parents=True, exist_ok=True)
-    template = str(Path(folder) / "%(id)s.%(ext)s")
-    cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-progress",
-           "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
-           "--merge-output-format", "mp4", "-o", template, url]
-    cookies = os.getenv("YTDLP_COOKIES_FILE")
-    if cookies and Path(cookies).exists():
-        cmd[3:3] = ["--cookies", cookies]
+    folder = Path(folder); folder.mkdir(parents=True, exist_ok=True)
+    template = str(folder / "%(id)s.%(ext)s")
+    base = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-progress", "--no-warnings",
+            "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
+            "--merge-output-format", "mp4", "--retries", "3", "-o", template]
+    # Newer YouTube extraction needs a JavaScript runtime (node or deno) when one is installed.
+    for rt in ("deno", "node"):
+        if shutil.which(rt):
+            base += ["--js-runtimes", rt]
+            break
+    # Optional cookies (Streamlit secret YTDLP_COOKIES = Netscape cookie text, or a file path).
+    cookie_text = os.getenv("YTDLP_COOKIES")
+    cookie_file = os.getenv("YTDLP_COOKIES_FILE")
+    if cookie_text:
+        cf = folder / "cookies.txt"; cf.write_text(cookie_text, encoding="utf-8"); cookie_file = str(cf)
+    if cookie_file and Path(cookie_file).exists():
+        base += ["--cookies", cookie_file]
+    # YouTube often rejects one client but accepts another, so try several in turn.
+    attempts = [[], ["--extractor-args", "youtube:player_client=tv,web_safari"],
+                ["--extractor-args", "youtube:player_client=android_vr"],
+                ["--extractor-args", "youtube:player_client=mweb"],
+                ["--extractor-args", "youtube:player_client=ios"]]
+    last = None
     try:
-        run(cmd)
-    except RuntimeError as e:
-        msg = str(e)
-        if "Sign in to confirm" in msg or "not a bot" in msg:
+        for extra in attempts:
+            try:
+                run(base + extra + [url]); last = None; break
+            except RuntimeError as e:
+                last = str(e)
+                for f in folder.glob("*.part"):
+                    f.unlink(missing_ok=True)
+    finally:
+        (folder / "cookies.txt").unlink(missing_ok=True)
+    if last:
+        if any(k in last for k in ("403", "Sign in", "not a bot", "Forbidden")):
             raise RuntimeError(
-                "YouTube blocked this download (bot check). This commonly happens on cloud servers. "
-                "Download the video yourself and use 'Upload a video', or run the app on your own laptop.")
-        raise
-    videos = [p for p in Path(folder).glob("*") if p.suffix.lower() in [".mp4", ".mkv", ".webm", ".mov"]]
+                "YouTube refused the download from this server after trying several methods. "
+                "This is a YouTube block on cloud IP addresses. Run the app on your own computer "
+                "(YouTube links work there), or use 'Upload a video'.")
+        raise RuntimeError("Download failed: " + last[-600:])
+    videos = [p for p in folder.glob("*") if p.suffix.lower() in [".mp4", ".mkv", ".webm", ".mov"]]
     if not videos:
         raise RuntimeError("yt-dlp completed but no video file was found.")
     return max(videos, key=lambda p: p.stat().st_mtime)
