@@ -1,4 +1,5 @@
 import os, json, shutil, zipfile, uuid, subprocess
+import pipeline
 from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
@@ -8,6 +9,22 @@ from pipeline import (
 )
 
 load_dotenv()
+
+def get_api_key():
+    key = os.getenv("ANTHROPIC_API_KEY")
+    if not key:
+        try:
+            key = st.secrets.get("ANTHROPIC_API_KEY")
+        except Exception:
+            key = None
+    return key or None
+
+def prune_outputs(root, keep=5):
+    """Streamlit Cloud storage is temporary and small: keep only the newest exports."""
+    folders = sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in folders[keep:]:
+        shutil.rmtree(old, ignore_errors=True)
+
 BASE = Path(__file__).parent
 UPLOADS = BASE / "uploads"
 OUTPUTS = BASE / "outputs"
@@ -31,8 +48,8 @@ div[data-testid="stMetric"] {background:#f5f4fb; padding:12px; border-radius:12p
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    model = st.selectbox("Whisper model", ["small", "base", "medium", "large-v3"], index=0,
-                         help="Small is a good starting point. Larger models are slower but may be more accurate.")
+    model = st.selectbox("Whisper model", ["tiny", "base", "small", "medium", "large-v3"], index=1,
+                         help="Base works well on Streamlit Cloud. Small is more accurate. Medium/large may run out of memory on the free cloud tier; use them on your own laptop.")
     language = st.text_input("Language (optional)", placeholder="auto-detect")
     count = st.slider("Number of clips", 1, 10, 5)
     min_len = st.slider("Minimum clip length (sec)", 15, 45, 30)
@@ -40,7 +57,7 @@ with st.sidebar:
     caption_style = st.selectbox("Caption style", ["Bold white", "Yellow highlight", "Minimal"])
     use_face = st.checkbox("Try face-aware vertical crop", value=True,
                            help="Uses OpenCV face detection when available; otherwise uses a centered crop.")
-    st.caption("AI clip selection uses Claude when ANTHROPIC_API_KEY is configured.")
+    st.caption("AI clip selection uses Claude when ANTHROPIC_API_KEY is configured." if get_api_key() else "No API key set: using free local clip selection.")
 
 tab1, tab2 = st.tabs(["✨ Create Shorts", "📁 Previous exports"])
 with tab1:
@@ -62,17 +79,19 @@ with tab1:
     if run:
         try:
             ensure_ffmpeg()
+            work_dir = UPLOADS / uuid.uuid4().hex[:8]
+            work_dir.mkdir(parents=True, exist_ok=True)
             if source_mode == "YouTube URL":
                 if not url.strip():
                     st.error("Paste a video URL first.")
                     st.stop()
                 with st.spinner("Downloading video…"):
-                    video_path = download_video(url.strip(), UPLOADS)
+                    video_path = download_video(url.strip(), work_dir)
             else:
                 if uploaded is None:
                     st.error("Choose a video first.")
                     st.stop()
-                video_path = save_upload(uploaded, UPLOADS)
+                video_path = save_upload(uploaded, work_dir)
 
             st.success(f"Video ready: {video_path.name}")
             duration = probe_duration(video_path)
@@ -83,8 +102,12 @@ with tab1:
             progress.progress(35, text="Finding the strongest moments…")
             clips = choose_clips(
                 transcript, duration, count, min_len, max_len,
-                api_key=os.getenv("ANTHROPIC_API_KEY")
+                api_key=get_api_key()
             )
+            if pipeline.LAST_SELECTOR["note"]:
+                st.warning(pipeline.LAST_SELECTOR["note"])
+            else:
+                st.caption("Clip selection: " + ("Claude AI" if pipeline.LAST_SELECTOR["mode"] == "claude" else "local scoring"))
             if not clips:
                 st.error("No suitable clips were found. Try a longer video or a smaller minimum duration.")
                 st.stop()
@@ -99,13 +122,20 @@ with tab1:
                 out = job_dir / f"short_{i:02d}.mp4"
                 render_clip(video_path, out, clip, transcript, caption_style, use_face)
                 results.append((out, clip))
+            with zipfile.ZipFile(job_dir / "shorts_export.zip", "w", zipfile.ZIP_DEFLATED) as z:
+                for p, _ in results:
+                    z.write(p, p.name)
             progress.progress(100, text="Finished!")
             st.session_state["latest_results"] = [(str(p), c) for p,c in results]
             st.session_state["latest_job"] = str(job_dir)
             st.success(f"Created {len(results)} Shorts.")
         except Exception as e:
             st.error(f"Something went wrong: {e}")
-            st.exception(e)
+        finally:
+            # Always delete the large source video and temp audio; keep only the finished Shorts.
+            if "work_dir" in locals():
+                shutil.rmtree(work_dir, ignore_errors=True)
+            prune_outputs(OUTPUTS)
 
     if "latest_results" in st.session_state:
         st.subheader("Your generated Shorts")
@@ -124,11 +154,9 @@ with tab1:
 
         job_dir = Path(st.session_state["latest_job"])
         zip_path = job_dir / "shorts_export.zip"
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-            for p in job_dir.glob("short_*.mp4"):
-                z.write(p, p.name)
-        st.download_button("📦 Download all Shorts (ZIP)", data=zip_path.read_bytes(),
-                           file_name="shorts_export.zip", mime="application/zip")
+        if zip_path.exists():
+            st.download_button("📦 Download all Shorts (ZIP)", data=zip_path.read_bytes(),
+                               file_name="shorts_export.zip", mime="application/zip")
 
 with tab2:
     folders = sorted([p for p in OUTPUTS.iterdir() if p.is_dir()], key=lambda p:p.stat().st_mtime, reverse=True)

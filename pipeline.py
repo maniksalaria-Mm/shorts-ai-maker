@@ -1,15 +1,21 @@
-import os, re, json, subprocess, shutil, math
+import os, re, sys, json, subprocess, shutil, math
 from pathlib import Path
 
-def run(cmd):
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+# Set by choose_clips() so the UI can tell the user which selector actually ran.
+LAST_SELECTOR = {"mode": "local", "note": ""}
+_WHISPER_CACHE = {}
+
+def run(cmd, cwd=None):
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd)
     if p.returncode:
         raise RuntimeError(p.stderr[-4000:] or "Command failed")
     return p.stdout
 
 def ensure_ffmpeg():
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        raise RuntimeError("FFmpeg/ffprobe not found. Install FFmpeg and add it to your PATH, then restart the terminal.")
+        raise RuntimeError(
+            "FFmpeg/ffprobe not found. On Streamlit Cloud, add a packages.txt file containing 'ffmpeg' "
+            "to the repo root and reboot the app. On Windows, install FFmpeg and add it to PATH.")
 
 def probe_duration(path):
     out = run(["ffprobe","-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",str(path)])
@@ -17,13 +23,27 @@ def probe_duration(path):
 
 def download_video(url, folder):
     # yt-dlp is used only when the user has rights/permission to download the source.
-    template = str(Path(folder) / "%(title).80s_%(id)s.%(ext)s")
-    run(["yt-dlp","--no-playlist","-f","bv*+ba/b","--merge-output-format","mp4","-o",template,url])
-    candidates = sorted(Path(folder).glob("*"))
-    videos = [p for p in candidates if p.suffix.lower() in [".mp4",".mkv",".webm",".mov"]]
+    Path(folder).mkdir(parents=True, exist_ok=True)
+    template = str(Path(folder) / "%(id)s.%(ext)s")
+    cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-progress",
+           "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
+           "--merge-output-format", "mp4", "-o", template, url]
+    cookies = os.getenv("YTDLP_COOKIES_FILE")
+    if cookies and Path(cookies).exists():
+        cmd[3:3] = ["--cookies", cookies]
+    try:
+        run(cmd)
+    except RuntimeError as e:
+        msg = str(e)
+        if "Sign in to confirm" in msg or "not a bot" in msg:
+            raise RuntimeError(
+                "YouTube blocked this download (bot check). This commonly happens on cloud servers. "
+                "Download the video yourself and use 'Upload a video', or run the app on your own laptop.")
+        raise
+    videos = [p for p in Path(folder).glob("*") if p.suffix.lower() in [".mp4", ".mkv", ".webm", ".mov"]]
     if not videos:
         raise RuntimeError("yt-dlp completed but no video file was found.")
-    return max(videos, key=lambda p:p.stat().st_mtime)
+    return max(videos, key=lambda p: p.stat().st_mtime)
 
 def save_upload(uploaded, folder):
     suffix = Path(uploaded.name).suffix.lower() or ".mp4"
@@ -31,24 +51,42 @@ def save_upload(uploaded, folder):
     path.write_bytes(uploaded.getbuffer())
     return path
 
+def extract_audio(video_path, wav_path):
+    """16 kHz mono WAV: small, fast to decode, and avoids pushing a large video through PyAV."""
+    try:
+        run(["ffmpeg", "-y", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000",
+             "-c:a", "pcm_s16le", str(wav_path)])
+    except RuntimeError as e:
+        raise RuntimeError("Could not read audio from this video (it may have no audio track). " + str(e)[-300:])
+    return wav_path
+
 def transcribe_video(video_path, model_name, language=None):
     from faster_whisper import WhisperModel
 
-    # Use CPU deliberately. CTranslate2 may detect a CUDA device even when
-    # the required CUDA/cuBLAS DLLs are missing on Windows.
-    print("Loading Faster-Whisper on CPU (int8)...")
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
-    segments, info = model.transcribe(str(video_path), language=language, word_timestamps=True, vad_filter=True)
-    result = []
-    for seg in segments:
-        words = []
-        if seg.words:
-            for w in seg.words:
-                words.append({"start":float(w.start),"end":float(w.end),"word":w.word})
-        result.append({"start":float(seg.start),"end":float(seg.end),"text":seg.text.strip(),"words":words})
+    # CPU on purpose: CTranslate2 may detect CUDA even when cuBLAS DLLs are missing.
+    if model_name not in _WHISPER_CACHE:
+        _WHISPER_CACHE.clear()  # keep only one model in RAM (Streamlit Cloud is memory-limited)
+        _WHISPER_CACHE[model_name] = WhisperModel(model_name, device="cpu", compute_type="int8")
+    model = _WHISPER_CACHE[model_name]
+    wav = Path(video_path).with_suffix(".16k.wav")
+    try:
+        extract_audio(video_path, wav)
+        segments, info = model.transcribe(str(wav), language=language, word_timestamps=True, vad_filter=True)
+        result = []
+        for seg in segments:
+            words = []
+            if seg.words:
+                for w in seg.words:
+                    words.append({"start": float(w.start), "end": float(w.end), "word": w.word})
+            result.append({"start": float(seg.start), "end": float(seg.end), "text": seg.text.strip(), "words": words})
+    finally:
+        try:
+            wav.unlink()
+        except OSError:
+            pass
     if not result:
         raise RuntimeError("No speech detected. Try another Whisper model or check the audio.")
-    return {"language":info.language,"segments":result}
+    return {"language": info.language, "segments": result}
 
 def _cuda_available():
     try:
@@ -59,20 +97,46 @@ def _cuda_available():
 
 def choose_clips(transcript, duration, count, min_len, max_len, api_key=None):
     segments = transcript["segments"]
+    LAST_SELECTOR.update(mode="local", note="")
+    clips = None
     if api_key:
         try:
-            return _claude_clips(segments, duration, count, min_len, max_len, api_key)
-        except Exception:
+            clips = _claude_clips(segments, duration, count, min_len, max_len, api_key)
+            if clips:
+                LAST_SELECTOR.update(mode="claude", note="")
+        except Exception as e:
             # A usable local fallback is preferable to failing the entire job.
-            pass
-    return _heuristic_clips(segments, duration, count, min_len, max_len)
+            LAST_SELECTOR.update(mode="local", note=f"Claude selection failed ({type(e).__name__}); used local selection instead.")
+    if not clips:
+        clips = _heuristic_clips(segments, duration, count, min_len, max_len)
+    return _snap_to_speech(clips, segments, duration, min_len, max_len)
+
+def _snap_to_speech(clips, segments, duration, min_len, max_len):
+    """Move each clip start/end to the nearest sentence boundary so cuts don't land mid-sentence."""
+    if not segments:
+        return clips
+    starts = [s["start"] for s in segments]; ends = [s["end"] for s in segments]
+    out = []
+    for c in clips:
+        a = min(starts, key=lambda t: abs(t - c["start"]))
+        b = min(ends, key=lambda t: abs(t - c["end"]))
+        a = max(0.0, a - 0.15); b = min(duration, b + 0.25)
+        if b - a < min_len * 0.8 or b - a > max_len * 1.1:
+            a, b = c["start"], c["end"]
+        out.append({**c, "start": a, "end": b})
+    out.sort(key=lambda x: x["start"])
+    clean = []
+    for c in out:  # snapping can create overlaps; drop any
+        if not clean or c["start"] >= clean[-1]["end"]:
+            clean.append(c)
+    return clean
 
 def _claude_clips(segments, duration, count, min_len, max_len, api_key):
     import anthropic
     compact = [{"start":round(s["start"],1),"end":round(s["end"],1),"text":s["text"]} for s in segments]
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
-        model="claude-3-5-haiku-latest", max_tokens=3000,
+        model=os.getenv("CLAUDE_MODEL", "claude-haiku-5-5"), max_tokens=3000,
         messages=[{"role":"user","content":
         "Select the best short-form video moments from this timestamped transcript. "
         f"Return exactly up to {count} non-overlapping clips, each {min_len}-{max_len} seconds, "
@@ -172,41 +236,59 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     Path(path).write_text(header+"\n".join(rows),encoding="utf-8")
 
 def render_clip(video, output, clip, transcript, caption_style, use_face):
-    start=float(clip["start"]); end=float(clip["end"]); duration=end-start
-    ass=output.with_suffix(".ass")
-    _make_ass(ass,transcript,start,end,caption_style)
-    # Center crop to 9:16. Face-aware option attempts to locate a face near the middle
-    # and offsets the crop horizontally; safe fallback is a centered crop.
-    x_expr="(iw-ih*9/16)/2"
+    output = Path(output)
+    start = float(clip["start"]); end = float(clip["end"]); duration = end - start
+    ass = output.with_suffix(".ass")
+    _make_ass(ass, transcript, start, end, caption_style)
+    # Crop width never exceeds the source width (portrait sources would otherwise fail).
+    crop_w = "min(iw\\,ih*9/16)"
+    x_expr = "(iw-ow)/2"
     if use_face:
         try:
-            x_expr=f"({_face_crop_x(video,start, end)})"
+            x_expr = f"min(iw-ow\\,max(0\\,{_face_crop_x(video, start, end)}))"
         except Exception:
             pass
-    ass_filter = str(ass).replace("\\\\", "/").replace(":", "\\\\:").replace("\\'", "\\\\\\'")
-    vf=f"crop=ih*9/16:ih:{x_expr}:0,scale=1080:1920,setsar=1,subtitles='{ass_filter}'"
-    run(["ffmpeg","-y","-ss",str(start),"-i",str(video),"-t",str(duration),"-vf",vf,
-         "-c:v","libx264","-preset","veryfast","-crf","21","-c:a","aac","-b:a","160k",
-         "-movflags","+faststart",str(output)])
+    # Run ffmpeg inside the output folder and reference the .ass by bare filename:
+    # no drive letters / backslashes / colons to escape, so it behaves the same on Windows and Linux.
+    vf = f"crop={crop_w}:ih:{x_expr}:0,scale=1080:1920,setsar=1,subtitles={ass.name}"
     try:
-        ass.unlink()
-    except OSError:
-        pass
+        run(["ffmpeg", "-y", "-ss", str(start), "-i", str(Path(video).resolve()), "-t", str(duration), "-vf", vf,
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", output.name],
+            cwd=str(output.parent.resolve()))
+    finally:
+        try:
+            ass.unlink()
+        except OSError:
+            pass
     return output
 
-def _face_crop_x(video,start,end):
+def _face_crop_x(video, start, end):
     import cv2
-    cap=cv2.VideoCapture(str(video))
-    cap.set(cv2.CAP_PROP_POS_MSEC, (start+end)*500)
-    ok, frame=cap.read(); cap.release()
-    if not ok: raise RuntimeError("No frame")
-    gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
-    cascade=cv2.CascadeClassifier(cv2.data.haarcascades+"haarcascade_frontalface_default.xml")
-    faces=cascade.detectMultiScale(gray,1.1,4,minSize=(50,50))
-    if len(faces)==0: raise RuntimeError("No face")
-    x,y,w,h=max(faces,key=lambda f:f[2]*f[3])
-    frame_w=frame.shape[1]; frame_h=frame.shape[0]
-    crop_w=frame_h*9/16
-    center=x+w/2
-    left=max(0,min(frame_w-crop_w,center-crop_w/2))
-    return str(round(left,2))
+    cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+    cascade = cv2.CascadeClassifier(str(cascade_path))
+    if cascade.empty():
+        raise RuntimeError("Face model not found")
+    cap = cv2.VideoCapture(str(video))
+    centers = []; frame_w = frame_h = 0
+    try:
+        # Sample several frames across the clip and use the median face position (steadier than one frame).
+        for frac in (0.1, 0.3, 0.5, 0.7, 0.9):
+            cap.set(cv2.CAP_PROP_POS_MSEC, (start + (end - start) * frac) * 1000)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            frame_h, frame_w = frame.shape[:2]
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = cascade.detectMultiScale(gray, 1.1, 4, minSize=(50, 50))
+            if len(faces):
+                x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                centers.append(x + w / 2)
+    finally:
+        cap.release()
+    if not centers:
+        raise RuntimeError("No face")
+    centers.sort()
+    center = centers[len(centers) // 2]
+    crop_w = frame_h * 9 / 16
+    return str(round(max(0, min(frame_w - crop_w, center - crop_w / 2)), 2))
