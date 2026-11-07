@@ -1,0 +1,7 @@
+streamlit>=1.38
+yt-dlp>=2024.10.22
+faster-whisper>=1.1.0
+av>=13.1.0
+anthropic>=0.40
+python-dotenv>=1.0
+opencv-python-headless>=4.10,<5
