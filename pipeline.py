@@ -83,6 +83,15 @@ def extract_audio(video_path, wav_path):
         raise RuntimeError("Could not read audio from this video (it may have no audio track). " + str(e)[-300:])
     return wav_path
 
+def _load_wav_array(wav_path):
+    """Read our own 16 kHz mono WAV into a float32 array, so faster-whisper never calls PyAV
+    (some PyAV versions are incompatible with faster-whisper: 'metadata_errors' error)."""
+    import wave
+    import numpy as np
+    with wave.open(str(wav_path), "rb") as w:
+        frames = w.readframes(w.getnframes())
+    return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+
 def transcribe_video(video_path, model_name, language=None):
     from faster_whisper import WhisperModel
 
@@ -94,7 +103,8 @@ def transcribe_video(video_path, model_name, language=None):
     wav = Path(video_path).with_suffix(".16k.wav")
     try:
         extract_audio(video_path, wav)
-        segments, info = model.transcribe(str(wav), language=language, word_timestamps=True, vad_filter=True)
+        audio = _load_wav_array(wav)
+        segments, info = model.transcribe(audio, language=language, word_timestamps=True, vad_filter=True)
         result = []
         for seg in segments:
             words = []
